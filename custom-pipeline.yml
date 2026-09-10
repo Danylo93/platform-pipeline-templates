@@ -1,0 +1,18 @@
+include:
+  - local: '/default-pipeline.yml'
+
+# Exemplo de customização sem duplicar o Golden Path inteiro.
+# A aplicação pode sobrescrever comportamento apenas quando necessário.
+custom-validation:
+  stage: validate
+  script:
+    - echo "Custom business/platform validation"
+
+# Exemplo: HML exige uma checagem adicional antes do deploy.
+deploy-hml:
+  stage: deploy-hml
+  before_script:
+    - echo "Running custom pre-deploy validation for HML"
+  script:
+    - ./scripts/deploy.sh hml
+  when: manual
