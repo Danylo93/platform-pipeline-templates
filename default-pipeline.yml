@@ -3,13 +3,15 @@ stages:
   - test
   - security
   - build
-  - deploy-ti
-  - deploy-hml
-  - deploy-prod
+  - publish
+  - gitops
 
 variables:
   APP_PORT: "8080"
-  IMAGE_TAG: "$CI_COMMIT_SHA"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  HARBOR_HOST: "harbor.local"
+  HARBOR_PROJECT: "platform-lab"
+  GITOPS_BRANCH: "deployment_files"
 
 validate:
   stage: validate
@@ -25,33 +27,26 @@ test:
 security:
   stage: security
   script:
-    - echo "LAB: add SAST/dependency/container scanning here"
+    - echo "LAB: dependency/SAST/container checks go here"
 
 build-image:
   stage: build
   script:
-    - echo "LAB: build image $CI_REGISTRY_IMAGE:$IMAGE_TAG"
+    - export IMAGE="$HARBOR_HOST/$HARBOR_PROJECT/$APP_NAME:$IMAGE_TAG"
+    - echo "Building $IMAGE with Podman/Buildah"
+    - podman build -t "$IMAGE" .
 
-deploy-ti:
-  stage: deploy-ti
+publish-image:
+  stage: publish
   script:
-    - ./scripts/deploy.sh ti
-  environment:
-    name: ti
+    - export IMAGE="$HARBOR_HOST/$HARBOR_PROJECT/$APP_NAME:$IMAGE_TAG"
+    - echo "$HARBOR_PASSWORD" | podman login "$HARBOR_HOST" -u "$HARBOR_USER" --password-stdin
+    - podman push "$IMAGE"
 
-deploy-hml:
-  stage: deploy-hml
+gitops-update:
+  stage: gitops
   script:
-    - ./scripts/deploy.sh hml
-  environment:
-    name: hml
-  when: manual
-
-deploy-prod:
-  stage: deploy-prod
-  script:
-    - ./scripts/deploy.sh prod
-  environment:
-    name: prod
-  when: manual
-  allow_failure: false
+    - echo "Update deployment_files/environments/ti/values.yaml with image tag $IMAGE_TAG"
+    - echo "Argo CD is responsible for reconciliation/deployment to OpenShift"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
