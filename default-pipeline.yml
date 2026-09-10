@@ -1,0 +1,57 @@
+stages:
+  - validate
+  - test
+  - security
+  - build
+  - deploy-ti
+  - deploy-hml
+  - deploy-prod
+
+variables:
+  APP_PORT: "8080"
+  IMAGE_TAG: "$CI_COMMIT_SHA"
+
+validate:
+  stage: validate
+  script:
+    - echo "Validating application and deployment files"
+
+test:
+  stage: test
+  script:
+    - npm ci
+    - npm test
+
+security:
+  stage: security
+  script:
+    - echo "LAB: add SAST/dependency/container scanning here"
+
+build-image:
+  stage: build
+  script:
+    - echo "LAB: build image $CI_REGISTRY_IMAGE:$IMAGE_TAG"
+
+deploy-ti:
+  stage: deploy-ti
+  script:
+    - ./scripts/deploy.sh ti
+  environment:
+    name: ti
+
+deploy-hml:
+  stage: deploy-hml
+  script:
+    - ./scripts/deploy.sh hml
+  environment:
+    name: hml
+  when: manual
+
+deploy-prod:
+  stage: deploy-prod
+  script:
+    - ./scripts/deploy.sh prod
+  environment:
+    name: prod
+  when: manual
+  allow_failure: false
