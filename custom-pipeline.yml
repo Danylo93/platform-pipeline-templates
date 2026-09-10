@@ -1,18 +1,17 @@
 include:
   - local: '/default-pipeline.yml'
 
-# Exemplo de customização sem duplicar o Golden Path inteiro.
-# A aplicação pode sobrescrever comportamento apenas quando necessário.
+# Exceção controlada ao Golden Path.
+# Use somente quando uma aplicação realmente precisar customizar o fluxo.
 custom-validation:
   stage: validate
   script:
-    - echo "Custom business/platform validation"
+    - echo "Running custom platform/business validation"
 
-# Exemplo: HML exige uma checagem adicional antes do deploy.
-deploy-hml:
-  stage: deploy-hml
-  before_script:
-    - echo "Running custom pre-deploy validation for HML"
+custom-security:
+  stage: security
   script:
-    - ./scripts/deploy.sh hml
-  when: manual
+    - echo "LAB: additional security policy for this application"
+
+# Exemplo: promoção para HML/PROD continua sendo feita por alteração GitOps,
+# nunca por 'oc apply' direto na pipeline.
