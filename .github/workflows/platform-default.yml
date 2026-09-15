@@ -1,0 +1,88 @@
+name: Platform default pipeline
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        required: true
+        type: string
+      application_prefix:
+        default: platform-sample
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, linux, x64, platform-lab]
+    timeout-minutes: 20
+    outputs:
+      image_tag: ${{ steps.validate.outputs.image_tag }}
+    env:
+      IMAGE_NAME: ${{ inputs.image_name }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Validate
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_NAME" =~ ^[a-z0-9]+([.-][a-z0-9]+)*$ ]]
+          [[ "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]
+          test -f Dockerfile
+          test -f package-lock.json
+          node --check src/server.js
+          docker info --format '{{.ServerVersion}}'
+          curl --fail --silent --show-error http://localhost:5000/v2/
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+      - name: Test
+        run: |
+          npm ci
+          npm test
+      - name: Security
+        run: npm audit --omit=dev --audit-level=high
+      - name: Build
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "http://localhost:5000/v2/$IMAGE_NAME/manifests/$IMAGE_TAG")
+          case "$status" in
+            200) echo 'exists=true' >> "$GITHUB_OUTPUT" ;;
+            404)
+              echo 'exists=false' >> "$GITHUB_OUTPUT"
+              docker build --label "org.opencontainers.image.revision=$IMAGE_TAG" \
+                --tag "$IMAGE_NAME:$IMAGE_TAG" .
+              ;;
+            *) echo "Registry returned HTTP $status" >&2; exit 1 ;;
+          esac
+      - name: Publish
+        if: steps.build.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag "$IMAGE_NAME:$IMAGE_TAG" "localhost:5000/$IMAGE_NAME:$IMAGE_TAG"
+          docker push "localhost:5000/$IMAGE_NAME:$IMAGE_TAG"
+
+  gitops:
+    needs: ci
+    permissions:
+      contents: write
+    uses: ./.github/workflows/platform-gitops.yml
+    with:
+      environment: ti
+      image_name: ${{ inputs.image_name }}
+      image_tag: ${{ needs.ci.outputs.image_tag }}
+      application_prefix: ${{ inputs.application_prefix }}

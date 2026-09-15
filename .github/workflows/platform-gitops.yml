@@ -1,0 +1,143 @@
+name: Update GitOps and verify rollout
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      image_name:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+      application_prefix:
+        default: platform-sample
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  gitops:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, linux, x64, platform-lab]
+    timeout-minutes: 15
+    concurrency:
+      group: platform-gitops-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      TARGET_ENV: ${{ inputs.environment }}
+      IMAGE_NAME: ${{ inputs.image_name }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      APPLICATION_PREFIX: ${{ inputs.application_prefix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: deployment_files
+          fetch-depth: 0
+      - name: Validate image and update environment YAML
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import urllib.request
+          import yaml
+
+          target = os.environ['TARGET_ENV']
+          name = os.environ['IMAGE_NAME']
+          tag = os.environ['IMAGE_TAG']
+          prefix = os.environ['APPLICATION_PREFIX']
+          if target not in ('ti', 'hml', 'prod'):
+              raise SystemExit('Invalid environment')
+          if not re.fullmatch(r'[a-z0-9]+([.-][a-z0-9]+)*', name):
+              raise SystemExit('Invalid image name')
+          if not re.fullmatch(r'[a-z0-9]+(-[a-z0-9]+)*', prefix):
+              raise SystemExit('Invalid application prefix')
+          if not re.fullmatch(r'[0-9a-f]{7,40}', tag):
+              raise SystemExit('Use a Git SHA image tag')
+          repository = f'platform-registry:5000/{name}'
+          request = urllib.request.Request(
+              f'http://localhost:5000/v2/{name}/manifests/{tag}', method='HEAD',
+              headers={'Accept': 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json'})
+          with urllib.request.urlopen(request, timeout=15) as response:
+              digest = response.headers['Docker-Content-Digest']
+              if not digest:
+                  raise SystemExit('Registry did not return an image digest')
+          source = {'hml': 'ti', 'prod': 'hml'}.get(target)
+          if source:
+              previous = yaml.safe_load(Path(f'gitops/environments/{source}/values.yaml').read_text())
+              if previous['image'] != {'repository': repository, 'tag': tag}:
+                  raise SystemExit('Promote the same image currently declared in the preceding environment')
+              app = json.loads(subprocess.check_output([
+                  'kubectl', '--context=kind-platform-lab', '-n', 'argocd', 'get',
+                  'application', f'{prefix}-{source}', '-o', 'json']))
+              status = app.get('status', {})
+              revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              if (status.get('health', {}).get('status') != 'Healthy'
+                      or status.get('sync', {}).get('status') != 'Synced'
+                      or status.get('sync', {}).get('revision') != revision):
+                  raise SystemExit('Preceding environment must be Healthy and Synced at the current GitOps revision')
+          path = Path(f'gitops/environments/{target}/values.yaml')
+          values = yaml.safe_load(path.read_text())
+          values['image'] = {'repository': repository, 'tag': tag}
+          path.write_text(yaml.safe_dump(values, sort_keys=False))
+          print(f'{target}: {repository}:{tag} ({digest})')
+          PY
+      - name: Validate Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm lint gitops/chart -f "gitops/environments/$TARGET_ENV/values.yaml"
+          helm template "$IMAGE_NAME" gitops/chart -n "platform-$TARGET_ENV" \
+            -f "gitops/environments/$TARGET_ENV/values.yaml" |
+            kubectl --context=kind-platform-lab apply --dry-run=server -n "platform-$TARGET_ENV" -f -
+      - name: Commit and push GitOps
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- "gitops/environments/$TARGET_ENV/values.yaml"
+          if ! git diff --cached --quiet; then
+            git commit -m "deploy($TARGET_ENV): $IMAGE_TAG"
+            git push origin HEAD:deployment_files
+          fi
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Verify Argo reconciliation and rollout
+        env:
+          EXPECTED_REVISION: ${{ steps.commit.outputs.revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+
+          app_name = os.environ['APPLICATION_PREFIX'] + '-' + os.environ['TARGET_ENV']
+          for attempt in range(60):
+              app = json.loads(subprocess.check_output([
+                  'kubectl', '--context=kind-platform-lab', '-n', 'argocd', 'get',
+                  'application', app_name, '-o', 'json']))
+              status = app.get('status', {})
+              sync = status.get('sync', {})
+              health = status.get('health', {}).get('status')
+              if (sync.get('status') == 'Synced' and health == 'Healthy'
+                      and sync.get('revision') == os.environ['EXPECTED_REVISION']):
+                  print(f'{app_name}: Synced / Healthy at {sync["revision"]}')
+                  break
+              time.sleep(5)
+          else:
+              raise SystemExit('Timed out waiting for Argo CD')
+          PY
+          kubectl --context=kind-platform-lab -n "platform-$TARGET_ENV" \
+            rollout status "deployment/$IMAGE_NAME" --timeout=120s
